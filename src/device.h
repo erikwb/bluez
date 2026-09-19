@@ -191,6 +191,7 @@ void btd_device_set_pnpid(struct btd_device *device, uint16_t source,
 			uint16_t vendor, uint16_t product, uint16_t version);
 
 int device_connect_le(struct btd_device *dev);
+bool device_cancel_connect_le(struct btd_device *dev);
 
 DBusMessage *device_connect_profiles(struct btd_device *dev,
 		uint8_t bdaddr_type, DBusMessage *msg, const char *uuid);

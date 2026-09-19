@@ -200,6 +200,13 @@ int btd_adapter_disconnect_device(struct btd_adapter *adapter,
 							const bdaddr_t *bdaddr,
 							uint8_t bdaddr_type);
 
+/* Accepted requests call callback exactly once, including on cancellation. */
+typedef void (*btd_disconnect_complete_t)(uint8_t status, void *user_data);
+int btd_adapter_disconnect_device_full(struct btd_adapter *adapter,
+				const bdaddr_t *bdaddr, uint8_t bdaddr_type,
+				btd_disconnect_complete_t callback,
+				void *user_data);
+
 int btd_adapter_remove_bonding(struct btd_adapter *adapter,
 				const bdaddr_t *bdaddr, uint8_t bdaddr_type);
 

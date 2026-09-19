@@ -15,6 +15,7 @@ struct btd_bearer;
 
 struct btd_bearer *btd_bearer_new(struct btd_device *device, uint8_t type);
 void btd_bearer_destroy(struct btd_bearer *bearer);
+bool btd_bearer_is_disconnecting(struct btd_bearer *bearer);
 
 void btd_bearer_paired(struct btd_bearer *bearer);
 void btd_bearer_bonded(struct btd_bearer *bearer);

@@ -50,12 +50,18 @@ properly e.g. due to misbehaving device.
 This method can be also used to cancel a preceding Connect call before a reply
 to it has been received.
 
+Pending low-level LE connections are also cancelled when **Connected** is false.
+If there is no pending or established connection, NotConnected is returned.
+Cancelling an LE connection does not disconnect the BR/EDR bearer.
+
 For non-trusted devices connected calling this method will disable incoming
 connections until Connect method is called again.
 
 Possible errors:
 
 :org.bluez.Error.NotConnected:
+:org.bluez.Error.InProgress:
+:org.bluez.Error.Failed:
 
 Signals
 -------

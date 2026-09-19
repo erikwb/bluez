@@ -649,6 +649,34 @@ unit_test_profile_SOURCES = unit/test-profile.c \
 			unit/btd.c $(bluetoothd_internal_sources)
 unit_test_profile_LDADD = $(bluetoothd_internal_ldadd)
 
+unit_tests += unit/test-bearer
+
+noinst_LTLIBRARIES += src/libbluetoothd-internal.la
+src_libbluetoothd_internal_la_SOURCES = $(bluetoothd_internal_sources)
+src_libbluetoothd_internal_la_CFLAGS = $(AM_CFLAGS)
+
+unit_test_bearer_SOURCES = unit/test-bearer.c unit/btd.c
+unit_test_bearer_LDADD = src/libbluetoothd-internal.la \
+					$(bluetoothd_internal_ldadd)
+unit_test_bearer_LDFLAGS = \
+	-Wl,--wrap=btd_adapter_disconnect_device \
+	-Wl,--wrap=btd_adapter_disconnect_device_full \
+	-Wl,--wrap=btd_adapter_get_address \
+	-Wl,--wrap=btd_adapter_get_address_type \
+	-Wl,--wrap=bt_io_connect \
+	-Wl,--wrap=g_dbus_register_interface \
+	-Wl,--wrap=g_dbus_unregister_interface \
+	-Wl,--wrap=g_dbus_send_message \
+	-Wl,--wrap=g_dbus_send_reply \
+	-Wl,--wrap=g_dbus_emit_property_changed \
+	-Wl,--wrap=g_dbus_emit_signal
+
+unit_tests += unit/test-adapter-disconnect
+
+unit_test_adapter_disconnect_SOURCES = unit/test-adapter-disconnect.c unit/btd.c
+unit_test_adapter_disconnect_LDADD = src/libbluetoothd-internal.la \
+					$(bluetoothd_internal_ldadd)
+
 unit_tests += unit/test-sdp
 
 unit_test_sdp_SOURCES = unit/test-sdp.c \

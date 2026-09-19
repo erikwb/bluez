@@ -174,22 +174,29 @@ static void write_watch_destroy(void *user_data)
 	mgmt->writer_active = false;
 }
 
+static void wakeup_writer(struct mgmt *mgmt);
+
 static bool request_timeout(void *data)
 {
 	struct mgmt_request *request = data;
+	struct mgmt *mgmt;
 
 	if (!request)
 		return false;
 
+	mgmt = mgmt_ref(request->mgmt);
 	request->timeout_id = 0;
 
-	queue_remove_if(request->mgmt->pending_list, NULL, request);
+	queue_remove(mgmt->pending_list, request);
 
 	if (request->callback)
 		request->callback(MGMT_STATUS_TIMEOUT, 0, NULL,
 						request->user_data);
 
 	destroy_request(request);
+
+	wakeup_writer(mgmt);
+	mgmt_unref(mgmt);
 
 	return false;
 }

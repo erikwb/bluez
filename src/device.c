@@ -256,6 +256,7 @@ struct btd_device {
 	uint8_t		bonding_status;
 	GSList		*disconnects;		/* disconnects message */
 	DBusMessage	*connect;		/* connect message */
+	uint8_t		connect_bdaddr_type;
 	DBusMessage	*disconnect;		/* disconnect message */
 	GAttrib		*attrib;
 
@@ -2453,8 +2454,10 @@ done:
 		/* Fallback to LE bearer if supported */
 		if (err == -EHOSTDOWN && dev->le && !dev->le_state.connected) {
 			err = device_connect_le(dev);
-			if (err == 0)
+			if (err == 0) {
+				dev->connect_bdaddr_type = dev->bdaddr_type;
 				return;
+			}
 		}
 
 		g_dbus_send_message(dbus_conn,
@@ -2851,6 +2854,7 @@ DBusMessage *device_connect_profiles(struct btd_device *dev,
 	}
 
 	dev->connect = dbus_message_ref(msg);
+	dev->connect_bdaddr_type = bdaddr_type;
 
 	return NULL;
 
@@ -2914,6 +2918,7 @@ static DBusMessage *dev_connect(DBusConnection *conn, DBusMessage *msg,
 			return btd_error_failed(msg, strerror(-err));
 
 		dev->connect = dbus_message_ref(msg);
+		dev->connect_bdaddr_type = bdaddr_type;
 
 		return NULL;
 	}
@@ -6671,6 +6676,9 @@ int device_connect_le(struct btd_device *dev)
 	GError *gerr = NULL;
 	char addr[18];
 
+	if (btd_bearer_is_disconnecting(dev->le))
+		return -EBUSY;
+
 	/* There is one connection attempt going on */
 	if (dev->att_io || dev->att)
 		return -EALREADY;
@@ -6765,6 +6773,9 @@ static int device_browse_gatt(struct btd_device *device, DBusMessage *msg)
 {
 	struct btd_adapter *adapter = device->adapter;
 	struct browse_req *req;
+
+	if (btd_bearer_is_disconnecting(device->le))
+		return -EBUSY;
 
 	req = browse_request_new(device, BROWSE_GATT, msg);
 	if (!req)
@@ -6889,6 +6900,40 @@ void device_cancel_browse(struct btd_device *device, uint8_t bdaddr_type)
 		attio_cleanup(device);
 
 	browse_request_free(device->browse);
+}
+
+bool device_cancel_connect_le(struct btd_device *dev)
+{
+	bool cancelled = false;
+
+	/* Shutdown suppresses att_connect_cb; finish its callers here. */
+	if (dev->att_io) {
+		g_io_channel_shutdown(dev->att_io, FALSE, NULL);
+		g_io_channel_unref(dev->att_io);
+		dev->att_io = NULL;
+		cancelled = true;
+	}
+
+	if (device_is_browsing(dev, BDADDR_LE_PUBLIC)) {
+		if (dev->browse->msg)
+			g_dbus_send_message(dbus_conn,
+					btd_error_le_errno(dev->browse->msg,
+								-ECONNABORTED));
+
+		device_cancel_browse(dev, BDADDR_LE_PUBLIC);
+		cancelled = true;
+	}
+
+	if (dev->connect && dev->connect_bdaddr_type != BDADDR_BREDR) {
+		g_dbus_send_message(dbus_conn,
+					btd_error_le_errno(dev->connect,
+								-ECONNABORTED));
+		dbus_message_unref(dev->connect);
+		dev->connect = NULL;
+		cancelled = true;
+	}
+
+	return cancelled;
 }
 
 int device_discover_services(struct btd_device *device,

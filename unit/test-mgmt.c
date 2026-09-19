@@ -416,6 +416,76 @@ static void test_destroy(gconstpointer data)
 	execute_context(context);
 }
 
+struct timeout_test {
+	struct context *context;
+	bool release;
+	unsigned int callbacks;
+	unsigned int destroyed;
+};
+
+static gboolean timeout_test_failed(gpointer data)
+{
+	g_error("Management timeout test did not complete");
+	return FALSE;
+}
+
+static void timeout_complete(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct timeout_test *test = user_data;
+	struct context *context = test->context;
+
+	g_assert_cmpuint(status, ==, MGMT_STATUS_TIMEOUT);
+	test->callbacks++;
+
+	if (!test->release)
+		return;
+
+	mgmt_unref(context->mgmt_client);
+	context->mgmt_client = NULL;
+	context_quit(context);
+}
+
+static void timeout_destroy(void *user_data)
+{
+	struct timeout_test *test = user_data;
+
+	test->destroyed++;
+}
+
+static void test_timeout(gconstpointer data)
+{
+	struct context *context = create_context();
+	struct timeout_test test = {
+		.context = context,
+		.release = GPOINTER_TO_INT(data),
+	};
+	guint deadline;
+	unsigned int id;
+
+	add_action(context, read_version_command, sizeof(read_version_command),
+				NULL, 0, 0, false, ACTION_IGNORE);
+	id = mgmt_send_timeout(context->mgmt_client, MGMT_OP_READ_VERSION,
+				MGMT_INDEX_NONE, 0, NULL, timeout_complete,
+				&test, timeout_destroy, 1);
+	g_assert_cmpuint(id, >, 0);
+
+	if (!test.release) {
+		add_action(context, read_info_command,
+					sizeof(read_info_command), NULL, 0, 0,
+					false, ACTION_PASSED);
+		id = mgmt_send(context->mgmt_client, MGMT_OP_READ_INFO, 0x0200,
+						0, NULL, NULL, NULL, NULL);
+		g_assert_cmpuint(id, >, 0);
+	}
+
+	deadline = g_timeout_add_seconds(5, timeout_test_failed, NULL);
+	execute_context(context);
+	g_source_remove(deadline);
+	g_assert_cmpuint(test.callbacks, ==, 1);
+	g_assert_cmpuint(test.destroyed, ==, 1);
+}
+
 int main(int argc, char *argv[])
 {
 	g_test_init(&argc, &argv, NULL);
@@ -437,6 +507,11 @@ int main(int argc, char *argv[])
 							test_unregister_index);
 
 	g_test_add_data_func("/mgmt/destroy/1", &event_test_1, test_destroy);
+
+	g_test_add_data_func("/mgmt/timeout/resume-queue", GINT_TO_POINTER(0),
+								test_timeout);
+	g_test_add_data_func("/mgmt/timeout/release-owner", GINT_TO_POINTER(1),
+								test_timeout);
 
 	return g_test_run();
 }

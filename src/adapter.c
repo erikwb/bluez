@@ -357,6 +357,8 @@ struct btd_adapter {
 
 	struct queue *exp_pending;
 	struct queue *exps;
+	GSList *disconnects;		/* Pending disconnect requests */
+	bool removing;
 };
 
 static char *adapter_power_state_str(uint32_t power_state)
@@ -630,6 +632,7 @@ static void trigger_pairable_timeout(struct btd_adapter *adapter);
 static void adapter_start(struct btd_adapter *adapter);
 static void adapter_stop(struct btd_adapter *adapter);
 static void trigger_passive_scanning(struct btd_adapter *adapter);
+static void cancel_disconnects(struct btd_adapter *adapter);
 static bool set_mode(struct btd_adapter *adapter, uint16_t opcode,
 							uint8_t mode);
 
@@ -7299,6 +7302,9 @@ static void adapter_remove(struct btd_adapter *adapter)
 
 	DBG("Removing adapter %s", adapter->path);
 
+	adapter->removing = true;
+	cancel_disconnects(adapter);
+
 	g_slist_free(adapter->connect_list);
 	adapter->connect_list = NULL;
 
@@ -8992,6 +8998,92 @@ int btd_adapter_disconnect_device(struct btd_adapter *adapter,
 				disconnect_complete, adapter, NULL) > 0)
 		return 0;
 
+	return -EIO;
+}
+
+struct disconnect_request {
+	struct btd_adapter *adapter;
+	unsigned int id;
+	btd_disconnect_complete_t callback;
+	void *user_data;
+};
+
+static void disconnect_request_free(void *user_data)
+{
+	struct disconnect_request *req = user_data;
+	struct btd_adapter *adapter = req->adapter;
+
+	adapter->disconnects = g_slist_remove(adapter->disconnects, req);
+
+	if (req->callback)
+		req->callback(MGMT_STATUS_CANCELLED, req->user_data);
+
+	btd_adapter_unref(adapter);
+	free(req);
+}
+
+static void cancel_disconnects(struct btd_adapter *adapter)
+{
+	while (adapter->disconnects) {
+		struct disconnect_request *req = adapter->disconnects->data;
+
+		adapter->disconnects = g_slist_delete_link(adapter->disconnects,
+							adapter->disconnects);
+		mgmt_cancel(adapter->mgmt, req->id);
+	}
+}
+
+static void disconnect_request_complete(uint8_t status, uint16_t length,
+					const void *param, void *user_data)
+{
+	struct disconnect_request *req = user_data;
+	struct btd_adapter *adapter = req->adapter;
+	btd_disconnect_complete_t callback = req->callback;
+
+	/* The command is no longer cancellable while its callback runs. */
+	adapter->disconnects = g_slist_remove(adapter->disconnects, req);
+	req->callback = NULL;
+
+	if (status == MGMT_STATUS_SUCCESS &&
+				length < sizeof(struct mgmt_rp_disconnect))
+		status = MGMT_STATUS_FAILED;
+
+	disconnect_complete(status, length, param, adapter);
+	callback(status, req->user_data);
+}
+
+int btd_adapter_disconnect_device_full(struct btd_adapter *adapter,
+				const bdaddr_t *bdaddr, uint8_t bdaddr_type,
+				btd_disconnect_complete_t callback,
+				void *user_data)
+{
+	struct mgmt_cp_disconnect cp = {};
+	struct disconnect_request *req;
+
+	if (adapter->removing)
+		return -ENODEV;
+
+	req = new0(struct disconnect_request, 1);
+	req->adapter = btd_adapter_ref(adapter);
+	req->callback = callback;
+	req->user_data = user_data;
+	bacpy(&cp.addr.bdaddr, bdaddr);
+	cp.addr.type = bdaddr_type;
+
+	/* Cancellation must not wait behind the command it needs to abort. */
+	req->id = mgmt_reply_timeout(adapter->mgmt, MGMT_OP_DISCONNECT,
+				adapter->dev_id, sizeof(cp), &cp,
+				disconnect_request_complete, req,
+				disconnect_request_free, 30);
+	if (req->id) {
+		adapter->disconnects = g_slist_prepend(adapter->disconnects,
+									req);
+		return 0;
+	}
+
+	/* Ownership only transfers when the command was queued. */
+	req->callback = NULL;
+	disconnect_request_free(req);
 	return -EIO;
 }
 

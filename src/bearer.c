@@ -50,6 +50,8 @@ struct btd_bearer {
 	const char *path;
 	unsigned int disconn_timer;
 	struct queue *disconnects; /* disconnects message */
+	bool cancelling;
+	bool connect_cancelled;
 
 	/* Connect() is defined as a single in-flight operation. To preserve
 	 * the API semantics of org.bluez.Device1.Connect(), we do not queue
@@ -95,6 +97,14 @@ static void bearer_disconnect_service(struct btd_service *service,
 }
 
 
+static uint8_t bearer_address_type(struct btd_bearer *bearer)
+{
+	if (bearer->type == BDADDR_BREDR)
+		return BDADDR_BREDR;
+
+	return btd_device_get_bdaddr_type(bearer->device);
+}
+
 static bool bearer_disconnect_link(gpointer user_data)
 {
 	struct btd_bearer *bearer = user_data;
@@ -105,7 +115,7 @@ static bool bearer_disconnect_link(gpointer user_data)
 	if (btd_device_bdaddr_type_connected(device, bearer->type))
 		btd_adapter_disconnect_device(device_get_adapter(device),
 						device_get_address(device),
-						bearer->type);
+						bearer_address_type(bearer));
 	return FALSE;
 }
 
@@ -122,7 +132,8 @@ static DBusMessage *bearer_connect(DBusConnection *conn, DBusMessage *msg,
 		return NULL;
 	}
 
-	if (device_is_bonding(device, NULL)) {
+	if (device_is_bonding(device, NULL) ||
+			btd_bearer_is_disconnecting(bearer)) {
 		if (msg)
 			return btd_error_in_progress(msg);
 		return NULL;
@@ -144,8 +155,80 @@ static DBusMessage *bearer_connect(DBusConnection *conn, DBusMessage *msg,
 	else {
 		btd_device_set_temporary(device, false);
 		err = device_connect_le(device);
-		if (err < 0)
+		if (err < 0) {
+			if (bearer->connect) {
+				dbus_message_unref(bearer->connect);
+				bearer->connect = NULL;
+			}
+
 			return btd_error_failed(msg, strerror(-err));
+		}
+	}
+
+	return NULL;
+}
+
+static void bearer_cancel_complete(uint8_t status, void *user_data)
+{
+	struct btd_bearer *bearer = user_data;
+	DBusMessage *msg;
+	DBusMessage *reply;
+
+	while ((msg = queue_pop_head(bearer->disconnects))) {
+		switch (status) {
+		case MGMT_STATUS_NOT_CONNECTED:
+			reply = bearer->connect_cancelled ?
+					dbus_message_new_method_return(msg) :
+					btd_error_not_connected(msg);
+			break;
+		case MGMT_STATUS_SUCCESS:
+		case MGMT_STATUS_DISCONNECTED:
+			reply = dbus_message_new_method_return(msg);
+			break;
+		default:
+			reply = btd_error_failed(msg, mgmt_errstr(status));
+		}
+
+		g_dbus_send_message(btd_get_dbus_connection(), reply);
+		dbus_message_unref(msg);
+	}
+
+	bearer->cancelling = false;
+	bearer->connect_cancelled = false;
+	btd_device_unref(bearer->device);
+}
+
+static DBusMessage *bearer_cancel_connect(struct btd_bearer *bearer,
+							DBusMessage *msg)
+{
+	struct btd_device *device = bearer->device;
+	int err;
+
+	/*
+	 * The kernel may have a pending LE link that is not yet connected
+	 * from bluetoothd's perspective. Always ask it to abort that link.
+	 * No Disconnected event is guaranteed for an incomplete connection.
+	 */
+	bearer->cancelling = true;
+	btd_device_ref(device);
+	err = btd_adapter_disconnect_device_full(device_get_adapter(device),
+					device_get_address(device),
+					bearer_address_type(bearer),
+					bearer_cancel_complete, bearer);
+	if (err < 0) {
+		bearer->cancelling = false;
+		btd_device_unref(device);
+		return btd_error_failed(msg, strerror(-err));
+	}
+
+	if (msg)
+		queue_push_tail(bearer->disconnects, dbus_message_ref(msg));
+
+	bearer->connect_cancelled = device_cancel_connect_le(device);
+
+	if (bearer->connect) {
+		bearer->connect_cancelled = true;
+		btd_bearer_connected(bearer, -ECONNABORTED);
 	}
 
 	return NULL;
@@ -157,20 +240,25 @@ static DBusMessage *bearer_disconnect(DBusConnection *conn, DBusMessage *msg,
 	struct btd_bearer *bearer = user_data;
 	struct btd_device *device = bearer->device;
 
-	if (!btd_device_bdaddr_type_connected(device, bearer->type)) {
-		if (msg)
-			return btd_error_not_connected(msg);
-		return NULL;
-	}
-
 	/* org.bluez.Device1.Disconnect() is in progress. Since it tears down
 	 * both LE and BR/EDR bearers, it takes precedence over bearer-level
 	 * disconnects. Ignore any bearer-specific disconnect requests here.
 	 */
-	if (device_is_disconnecting(device)) {
+	if (device_is_disconnecting(device) || bearer->cancelling) {
 		if (msg)
 			return btd_error_in_progress(msg);
 		return NULL;
+	}
+
+	if (!btd_device_bdaddr_type_connected(device, bearer->type)) {
+		if (bearer->type == BDADDR_BREDR)
+			return msg ? btd_error_not_connected(msg) : NULL;
+
+		/* Pairing owns ATT until it completes or is cancelled. */
+		if (device_is_bonding(device, NULL))
+			return msg ? btd_error_in_progress(msg) : NULL;
+
+		return bearer_cancel_connect(bearer, msg);
 	}
 
 	if (msg)
@@ -315,6 +403,9 @@ void btd_bearer_destroy(struct btd_bearer *bearer)
 	if (!bearer)
 		return;
 
+	if (bearer->disconn_timer)
+		timeout_remove(bearer->disconn_timer);
+
 	if (!bearer->path) {
 		bearer_free(bearer);
 		return;
@@ -332,6 +423,11 @@ void btd_bearer_destroy(struct btd_bearer *bearer)
 
 	g_dbus_unregister_interface(btd_get_dbus_connection(), bearer->path,
 					bearer_interface(bearer->type));
+}
+
+bool btd_bearer_is_disconnecting(struct btd_bearer *bearer)
+{
+	return bearer && (bearer->cancelling || bearer->disconn_timer);
 }
 
 void btd_bearer_paired(struct btd_bearer *bearer)
@@ -393,7 +489,19 @@ void btd_bearer_disconnected(struct btd_bearer *bearer, uint8_t reason)
 	if (!btd_device_is_connected(bearer->device))
 		device_disconnect_watches_callback(bearer->device);
 
-	while (!queue_isempty(bearer->disconnects)) {
+	if (bearer->disconn_timer) {
+		timeout_remove(bearer->disconn_timer);
+		bearer->disconn_timer = 0;
+	}
+
+	/*
+	 * Complete cancellation from its command reply, so a caller can safely
+	 * reconnect as soon as Disconnect returns.
+	 */
+	if (bearer->cancelling)
+		bearer->connect_cancelled = true;
+
+	while (!bearer->cancelling && !queue_isempty(bearer->disconnects)) {
 		entry = queue_get_entries(bearer->disconnects);
 		msg = entry->data;
 		g_dbus_send_reply(btd_get_dbus_connection(), msg,
